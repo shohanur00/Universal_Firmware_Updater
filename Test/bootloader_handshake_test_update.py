@@ -7,7 +7,7 @@ import struct
 # Configuration
 # ==============================================================
 
-PORT = "COM11"
+PORT = "COM9"
 BAUDRATE = 115200
 TIMEOUT = 1.0
 
@@ -552,7 +552,7 @@ def test_fw_size(ser):
 
     clear_rx(ser)
 
-    firmware_size = 1024
+    firmware_size = 2048
 
     data = struct.pack(
         "<I",
