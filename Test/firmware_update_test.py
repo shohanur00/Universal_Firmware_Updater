@@ -1,437 +1,737 @@
 import serial
-import struct
 import time
-import sys
+import struct
+from pathlib import Path
 
 
-# ============================================================
+# ==============================================================
 # Configuration
-# ============================================================
+# ==============================================================
 
-PORT = "COM6"                 # <-- Change this
+PORT = "COM7"
 BAUDRATE = 115200
+TIMEOUT = 10.0
 
-SOF = 0xA5
-
-MAX_DATA_SIZE = 16
-
-# Bootloader commands
-CMD_SYNC                  = 0x20
-CMD_FW_UPDATE_REQ         = 0x31
-CMD_FW_UPDATE_RES         = 0x37
-CMD_DEVICE_ID_REQ         = 0x3C
-CMD_DEVICE_ID_RES         = 0x3F
-CMD_FW_SIZE               = 0x42
-CMD_FW_OVER_SIZE          = 0x45
-CMD_SET_APP_START_ADDRESS = 0x4A
-CMD_APP_START_ADDRESS_ERR = 0x4B
-CMD_FW_DATA               = 0x50
-CMD_READY_FOR_DATA        = 0x48
-CMD_UPDATE_SUCCESSFUL     = 0x54
-CMD_ACK                   = 0x15
-CMD_NACK                  = 0x59
-CMD_RETX                  = 0x19
-CMD_CRC_CHECK             = 0x3B
-
-# Error codes
-ERROR_NONE            = 0x00
-ERROR_CRC             = 0x01
-ERROR_LENGTH          = 0x02
-ERROR_COMMAND         = 0x03
-ERROR_STATE            = 0x04
-ERROR_ADDRESS          = 0x05
-ERROR_SIZE             = 0x06
-ERROR_PROTOCOL         = 0x07
-
-ERROR_DEVICE_ID        = 0x08
-ERROR_NO_RETRY_PACKET  = 0x09
-ERROR_FLASH_ERASE      = 0x0A
-ERROR_DATA             = 0x0B
-
-# STM32G4 application address
+# Application start address
 APP_START_ADDRESS = 0x08004000
 
+# Maximum firmware data per protocol packet
+MAX_DATA_SIZE = 16
+
 # Firmware file
-FIRMWARE_FILE = "firmware.bin"
+# The script searches for the .bin file automatically
+# in the same directory and its parent directory.
+SCRIPT_DIR = Path(__file__).resolve().parent
 
 
-# ============================================================
+def find_firmware_file():
+    """
+    Find firmware .bin automatically.
+
+    Priority:
+        1. firmware.bin
+        2. PROJECT_NAME.bin
+        3. First .bin file found
+    """
+
+    candidates = [
+        SCRIPT_DIR / "firmware.bin",
+        SCRIPT_DIR.parent / "firmware.bin",
+    ]
+
+    for file in candidates:
+        if file.exists():
+            return file
+
+    # Search .bin files in script directory
+    bin_files = list(SCRIPT_DIR.glob("*.bin"))
+
+    if len(bin_files) == 1:
+        return bin_files[0]
+
+    # Search .bin files in parent directory
+    bin_files = list(SCRIPT_DIR.parent.glob("*.bin"))
+
+    if len(bin_files) == 1:
+        return bin_files[0]
+
+    return None
+
+
+FIRMWARE_FILE = find_firmware_file()
+
+
+# ==============================================================
+# Protocol
+# ==============================================================
+
+BL_PROTOCOL_SOF = 0xA5
+
+BL_PACKET_TYPE_COMMAND = 0x01
+BL_PACKET_TYPE_DATA = 0x02
+
+
+# ==============================================================
+# Commands
+# ==============================================================
+
+BL_CMD_NONE                    = 0x00
+BL_CMD_SYNC_OBSERVED          = 0x20
+BL_CMD_FW_UPDATE_REQ          = 0x31
+BL_CMD_FW_UPDATE_RES          = 0x37
+BL_CMD_DEVICE_ID_REQ          = 0x3C
+BL_CMD_DEVICE_ID_RES          = 0x3F
+BL_CMD_FW_SIZE                = 0x42
+BL_CMD_FW_OVER_SIZE           = 0x45
+BL_CMD_SET_APP_START_ADDRESS  = 0x4A
+BL_CMD_APP_START_ADDRESS_ERROR = 0x4B
+BL_CMD_FW_DATA                = 0x50
+BL_CMD_READY_FOR_DATA         = 0x48
+BL_CMD_UPDATE_SUCCESSFUL      = 0x54
+BL_CMD_ACK                    = 0x15
+BL_CMD_NACK                   = 0x59
+BL_CMD_RETX                   = 0x19
+BL_CMD_CRC_CHECK              = 0x3B
+
+
+# ==============================================================
+# Error Codes
+# ==============================================================
+
+BL_ERROR_NONE            = 0x00
+BL_ERROR_CRC             = 0x01
+BL_ERROR_LENGTH          = 0x02
+BL_ERROR_COMMAND         = 0x03
+BL_ERROR_STATE           = 0x04
+BL_ERROR_ADDRESS         = 0x05
+BL_ERROR_SIZE            = 0x06
+BL_ERROR_PROTOCOL        = 0x07
+BL_ERROR_DEVICE_ID       = 0x08
+BL_ERROR_NO_RETRY_PACKET = 0x09
+BL_ERROR_FLASH_ERASE     = 0x0A
+BL_ERROR_DATA            = 0x0B
+
+
+# ==============================================================
 # CRC16-CCITT-FALSE
-# ============================================================
+#
+# Polynomial : 0x1021
+# Initial    : 0xFFFF
+# Input      : MSB first
+#
+# IMPORTANT:
+#
+# CRC is calculated over:
+#
+#     LENGTH + TYPE + COMMAND + DATA
+#
+# SOF is NOT included.
+#
+# CRC is transmitted Big-Endian.
+# ==============================================================
 
-def crc16_ccitt_false(data):
+def crc16_ccitt_false(data: bytes) -> int:
+
     crc = 0xFFFF
 
     for byte in data:
+
         crc ^= (byte << 8)
 
         for _ in range(8):
+
             if crc & 0x8000:
-                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+
+                crc = (
+                    (crc << 1) ^ 0x1021
+                ) & 0xFFFF
+
             else:
-                crc = (crc << 1) & 0xFFFF
+
+                crc = (
+                    crc << 1
+                ) & 0xFFFF
 
     return crc
 
 
-# ============================================================
-# Packet Builder
-# ============================================================
+# ==============================================================
+# Create Command Packet
+#
+# Frame:
+#
+# SOF | LENGTH | TYPE | COMMAND | CRC_H | CRC_L
+#
+# Example:
+#
+# A5 02 01 20 XX XX
+# ==============================================================
 
-def make_packet(command, data=b""):
-    payload = bytes([command]) + data
+def create_command(command: int) -> bytes:
 
-    length = len(payload)
+    length = 2
 
-    if length > MAX_DATA_SIZE:
+    body = bytes([
+        length,
+        BL_PACKET_TYPE_COMMAND,
+        command
+    ])
+
+    crc = crc16_ccitt_false(body)
+
+    return (
+        bytes([BL_PROTOCOL_SOF])
+        + body
+        + struct.pack(">H", crc)
+    )
+
+
+# ==============================================================
+# Create Command + Data Packet
+#
+# Frame:
+#
+# SOF | LENGTH | TYPE | COMMAND | DATA | CRC_H | CRC_L
+# ==============================================================
+
+def create_command_data(
+    command: int,
+    data: bytes
+) -> bytes:
+
+    length = 2 + len(data)
+
+    if length > (MAX_DATA_SIZE + 2):
         raise ValueError(
-            f"Payload too large: {length} bytes"
+            "Command data is too large"
         )
 
-    # SOF + LENGTH + DATA
-    frame_without_crc = (
-        bytes([SOF]) +
-        bytes([length]) +
-        payload
+    body = bytes([
+        length,
+        BL_PACKET_TYPE_COMMAND,
+        command
+    ]) + data
+
+    crc = crc16_ccitt_false(body)
+
+    return (
+        bytes([BL_PROTOCOL_SOF])
+        + body
+        + struct.pack(">H", crc)
     )
 
-    crc = crc16_ccitt_false(frame_without_crc)
 
-    # CRC = little endian
-    frame = (
-        frame_without_crc +
-        struct.pack("<H", crc)
-    )
+# ==============================================================
+# Create Firmware Data Packet
+#
+# TYPE = DATA
+#
+# Frame:
+#
+# SOF | LENGTH | TYPE | COMMAND | DATA | CRC_H | CRC_L
+# ==============================================================
 
-    return frame
+def create_firmware_data(
+    data: bytes
+) -> bytes:
 
-
-# ============================================================
-# Packet Receiver
-# ============================================================
-
-def receive_packet(ser, timeout=2.0):
-
-    start_time = time.time()
-
-    # -------------------------
-    # Wait for SOF
-    # -------------------------
-
-    while True:
-
-        if time.time() - start_time > timeout:
-            raise TimeoutError("Timeout waiting for SOF")
-
-        byte = ser.read(1)
-
-        if not byte:
-            continue
-
-        if byte[0] == SOF:
-            break
-
-    # -------------------------
-    # Read LENGTH
-    # -------------------------
-
-    length_byte = ser.read(1)
-
-    if len(length_byte) != 1:
-        raise TimeoutError("Timeout waiting for LENGTH")
-
-    length = length_byte[0]
-
-    if length == 0 or length > MAX_DATA_SIZE:
+    if len(data) == 0:
         raise ValueError(
-            f"Invalid packet length: {length}"
+            "Firmware data cannot be empty"
         )
 
-    # -------------------------
-    # Read DATA
-    # -------------------------
-
-    data = ser.read(length)
-
-    if len(data) != length:
-        raise TimeoutError("Timeout waiting for DATA")
-
-    # -------------------------
-    # Read CRC
-    # -------------------------
-
-    crc_bytes = ser.read(2)
-
-    if len(crc_bytes) != 2:
-        raise TimeoutError("Timeout waiting for CRC")
-
-    received_crc = struct.unpack("<H", crc_bytes)[0]
-
-    # -------------------------
-    # Verify CRC
-    # -------------------------
-
-    frame_without_crc = (
-        bytes([SOF]) +
-        bytes([length]) +
-        data
-    )
-
-    calculated_crc = crc16_ccitt_false(
-        frame_without_crc
-    )
-
-    if received_crc != calculated_crc:
-
-        print(
-            f"[RX] CRC ERROR "
-            f"received=0x{received_crc:04X} "
-            f"calculated=0x{calculated_crc:04X}"
+    if len(data) > MAX_DATA_SIZE:
+        raise ValueError(
+            "Firmware data exceeds 16 bytes"
         )
 
-        return None
+    length = 2 + len(data)
 
-    command = data[0]
-    payload = data[1:]
+    body = bytes([
+        length,
+        BL_PACKET_TYPE_DATA,
+        BL_CMD_FW_DATA
+    ]) + data
 
-    return command, payload
+    crc = crc16_ccitt_false(body)
+
+    return (
+        bytes([BL_PROTOCOL_SOF])
+        + body
+        + struct.pack(">H", crc)
+    )
 
 
-# ============================================================
+# ==============================================================
+# Clear RX Buffer
+# ==============================================================
+
+def clear_rx(ser):
+
+    time.sleep(0.05)
+
+    while ser.in_waiting:
+
+        ser.read(ser.in_waiting)
+
+
+# ==============================================================
 # Send Packet
-# ============================================================
+# ==============================================================
 
-def send_packet(ser, command, data=b""):
-
-    packet = make_packet(command, data)
+def send_packet(
+    ser,
+    packet: bytes
+):
 
     print(
-        f"[TX] CMD=0x{command:02X} "
-        f"DATA={len(data)} "
-        f"FRAME={packet.hex(' ')}"
+        "[TX]",
+        " ".join(
+            f"{byte:02X}"
+            for byte in packet
+        )
     )
 
     ser.write(packet)
     ser.flush()
 
 
-# ============================================================
-# Wait for ACK
-# ============================================================
+# ==============================================================
+# Receive Packet
+# ==============================================================
 
-def wait_for_ack(ser):
+def receive_packet(
+    ser,
+    timeout=10.0
+):
 
-    response = receive_packet(ser)
+    start_time = time.time()
 
-    if response is None:
-        raise RuntimeError("Bootloader response CRC error")
+    rx = bytearray()
 
-    command, data = response
+    while (
+        time.time() - start_time
+    ) < timeout:
 
-    print(
-        f"[RX] CMD=0x{command:02X} "
-        f"DATA={data.hex(' ')}"
+        if ser.in_waiting:
+
+            rx.extend(
+                ser.read(
+                    ser.in_waiting
+                )
+            )
+
+            # Need at least:
+            #
+            # SOF + LENGTH + TYPE + CMD + CRC
+            #
+            if len(rx) >= 6:
+
+                # Find SOF
+                try:
+                    sof_index = rx.index(
+                        BL_PROTOCOL_SOF
+                    )
+                except ValueError:
+                    rx.clear()
+                    continue
+
+                if sof_index > 0:
+
+                    del rx[:sof_index]
+
+                if len(rx) < 2:
+                    continue
+
+                length = rx[1]
+
+                total_length = (
+                    1 + 1 + length + 2
+                )
+
+                if len(rx) >= total_length:
+
+                    packet = bytes(
+                        rx[:total_length]
+                    )
+
+                    print(
+                        "[RX]",
+                        " ".join(
+                            f"{byte:02X}"
+                            for byte in packet
+                        )
+                    )
+
+                    return parse_packet(
+                        packet
+                    )
+
+        time.sleep(0.005)
+
+    print("[RX] TIMEOUT")
+
+    return None
+
+
+# ==============================================================
+# Parse Packet
+# ==============================================================
+
+def parse_packet(
+    packet: bytes
+):
+
+    if len(packet) < 6:
+
+        print(
+            "ERROR: Invalid packet length"
+        )
+
+        return None
+
+    if packet[0] != BL_PROTOCOL_SOF:
+
+        print(
+            "ERROR: Invalid SOF"
+        )
+
+        return None
+
+    length = packet[1]
+
+    expected_length = (
+        1 + 1 + length + 2
     )
 
-    if command == CMD_ACK:
+    if len(packet) != expected_length:
+
+        print(
+            "ERROR: Invalid frame length"
+        )
+
+        return None
+
+    received_crc = struct.unpack(
+        ">H",
+        packet[-2:]
+    )[0]
+
+    calculated_crc = crc16_ccitt_false(
+        packet[1:-2]
+    )
+
+    if received_crc != calculated_crc:
+
+        print(
+            f"CRC ERROR: "
+            f"received=0x{received_crc:04X} "
+            f"calculated=0x{calculated_crc:04X}"
+        )
+
+        return None
+
+    return {
+        "sof": packet[0],
+        "length": packet[1],
+        "type": packet[2],
+        "command": packet[3],
+        "data": packet[4:-2],
+        "crc": received_crc
+    }
+
+
+# ==============================================================
+# Wait For Specific Command
+# ==============================================================
+
+def wait_for_command(
+    ser,
+    expected_command: int,
+    timeout=10.0
+):
+
+    packet = receive_packet(
+        ser,
+        timeout
+    )
+
+    if packet is None:
+
+        return None
+
+    if packet["command"] != expected_command:
+
+        print(
+            f"ERROR: Expected CMD=0x"
+            f"{expected_command:02X}, "
+            f"got CMD=0x"
+            f"{packet['command']:02X}"
+        )
+
+        return None
+
+    return packet
+
+
+# ==============================================================
+# Wait For ACK
+# ==============================================================
+
+def wait_for_ack(
+    ser,
+    timeout=10.0
+):
+
+    packet = receive_packet(
+        ser,
+        timeout
+    )
+
+    if packet is None:
+
+        return False
+
+    if packet["command"] == BL_CMD_ACK:
+
+        print("ACK received")
+
         return True
 
-    if command == CMD_NACK:
+    if packet["command"] == BL_CMD_NACK:
 
-        error = data[0] if len(data) > 0 else 0xFF
+        if len(packet["data"]) > 0:
 
-        raise RuntimeError(
-            f"Bootloader NACK, error=0x{error:02X}"
-        )
+            error = packet["data"][0]
 
-    raise RuntimeError(
-        f"Unexpected response: 0x{command:02X}"
+            print(
+                f"NACK received: "
+                f"ERROR=0x{error:02X}"
+            )
+
+        else:
+
+            print(
+                "NACK received"
+            )
+
+        return False
+
+    print(
+        f"Unexpected response: "
+        f"CMD=0x{packet['command']:02X}"
+    )
+
+    return False
+
+
+# ==============================================================
+# Firmware CRC
+#
+# CRC is calculated over actual firmware bytes only.
+#
+# Padding bytes are NOT included.
+# ==============================================================
+
+def calculate_firmware_crc(
+    firmware: bytes
+) -> int:
+
+    return crc16_ccitt_false(
+        firmware
     )
 
 
-# ============================================================
-# Wait for specific command
-# ============================================================
+# ==============================================================
+# Send SYNC
+# ==============================================================
 
-def wait_for_command(ser, expected_command):
+def send_sync(ser):
 
-    response = receive_packet(ser)
+    print(
+        "\n[1] Sending SYNC..."
+    )
+
+    clear_rx(ser)
+
+    packet = create_command(
+        BL_CMD_SYNC_OBSERVED
+    )
+
+    send_packet(
+        ser,
+        packet
+    )
+
+    print("Waiting 5 seconds...")
+    time.sleep(7)
+
+    return wait_for_ack(
+        ser
+    )
+
+    
+
+
+# ==============================================================
+# Request Device ID
+# ==============================================================
+
+def request_device_id(ser):
+
+    print(
+        "\n[2] Requesting Device ID..."
+    )
+
+    clear_rx(ser)
+
+    packet = create_command(
+        BL_CMD_DEVICE_ID_REQ
+    )
+
+    send_packet(
+        ser,
+        packet
+    )
+
+    response = receive_packet(
+        ser
+    )
 
     if response is None:
-        raise RuntimeError("Bootloader response CRC error")
 
-    command, data = response
+        return False
 
-    print(
-        f"[RX] CMD=0x{command:02X} "
-        f"DATA={data.hex(' ')}"
-    )
+    if response["command"] != BL_CMD_DEVICE_ID_RES:
 
-    if command == CMD_NACK:
-
-        error = data[0] if len(data) > 0 else 0xFF
-
-        raise RuntimeError(
-            f"Bootloader NACK, error=0x{error:02X}"
+        print(
+            f"ERROR: Expected DEVICE_ID_RES, "
+            f"got CMD=0x"
+            f"{response['command']:02X}"
         )
 
-    if command != expected_command:
+        return False
 
-        raise RuntimeError(
-            f"Expected 0x{expected_command:02X}, "
-            f"received 0x{command:02X}"
-        )
-
-    return data
-
-
-# ============================================================
-# Firmware Update
-# ============================================================
-
-def firmware_update():
-
-    # --------------------------------------------------------
-    # Read firmware
-    # --------------------------------------------------------
-
-    with open(FIRMWARE_FILE, "rb") as file:
-        firmware = file.read()
-
-    firmware_size = len(firmware)
-
-    print()
-    print("=" * 60)
-    print(" STM32 BOOTLOADER FIRMWARE UPDATE")
-    print("=" * 60)
-
-    print(
-        f"Firmware size : {firmware_size} bytes "
-        f"({firmware_size / 1024:.2f} KB)"
-    )
-
-    print(
-        f"App address   : 0x{APP_START_ADDRESS:08X}"
-    )
-
-    # --------------------------------------------------------
-    # Calculate firmware CRC
-    # --------------------------------------------------------
-
-    firmware_crc = crc16_ccitt_false(firmware)
-
-    print(
-        f"Firmware CRC  : 0x{firmware_crc:04X}"
-    )
-
-    # --------------------------------------------------------
-    # Open serial
-    # --------------------------------------------------------
-
-    ser = serial.Serial(
-        PORT,
-        BAUDRATE,
-        timeout=0.5
-    )
-
-    time.sleep(0.1)
-
-    print()
-    print("Serial connected.")
-
-    # ========================================================
-    # 1. SYNC
-    # ========================================================
-
-    print()
-    print("[1] Sending SYNC...")
-
-    send_packet(
-        ser,
-        CMD_SYNC
-    )
-
-    wait_for_ack(ser)
-
-    print("SYNC ACK")
-
-    # ========================================================
-    # 2. DEVICE ID
-    # ========================================================
-
-    print()
-    print("[2] Requesting Device ID...")
-
-    send_packet(
-        ser,
-        CMD_DEVICE_ID_REQ
-    )
-
-    device_id = wait_for_command(
-        ser,
-        CMD_DEVICE_ID_RES
-    )
+    device_id = response["data"]
 
     print(
         "Device ID:",
-        device_id.hex(" ")
+        " ".join(
+            f"{byte:02X}"
+            for byte in device_id
+        )
     )
 
-    # ========================================================
-    # 3. Firmware Size
-    # ========================================================
+    if len(device_id) != 12:
 
-    print()
-    print("[3] Sending firmware size...")
+        print(
+            "ERROR: Device ID must contain "
+            "12 bytes"
+        )
 
-    size_data = struct.pack(
+        return False
+
+    return True
+
+
+# ==============================================================
+# Send Firmware Size
+# ==============================================================
+
+def send_firmware_size(
+    ser,
+    firmware_size: int
+):
+
+    print(
+        "\n[3] Sending firmware size..."
+    )
+
+    print(
+        f"Firmware size: "
+        f"{firmware_size} bytes"
+    )
+
+    clear_rx(ser)
+
+    data = struct.pack(
         "<I",
         firmware_size
     )
 
-    send_packet(
-        ser,
-        CMD_FW_SIZE,
-        size_data
+    packet = create_command_data(
+        BL_CMD_FW_SIZE,
+        data
     )
 
-    wait_for_ack(ser)
+    send_packet(
+        ser,
+        packet
+    )
 
-    print("Firmware size accepted.")
+    return wait_for_ack(
+        ser
+    )
 
-    # ========================================================
-    # 4. Application Start Address
-    # ========================================================
 
-    print()
-    print("[4] Sending application start address...")
+# ==============================================================
+# Send Application Start Address
+# ==============================================================
 
-    address_data = struct.pack(
+def send_start_address(ser):
+
+    print(
+        "\n[4] Sending application "
+        "start address..."
+    )
+
+    print(
+        f"App address: "
+        f"0x{APP_START_ADDRESS:08X}"
+    )
+
+    clear_rx(ser)
+
+    data = struct.pack(
         "<I",
         APP_START_ADDRESS
     )
 
-    send_packet(
-        ser,
-        CMD_SET_APP_START_ADDRESS,
-        address_data
+    packet = create_command_data(
+        BL_CMD_SET_APP_START_ADDRESS,
+        data
     )
 
-    wait_for_ack(ser)
+    send_packet(
+        ser,
+        packet
+    )
 
-    print("Application address accepted.")
+    return wait_for_ack(
+        ser
+    )
 
-    # ========================================================
-    # 5. Firmware Data
-    # ========================================================
 
-    print()
-    print("[5] Sending firmware data...")
+# ==============================================================
+# Send Firmware
+# ==============================================================
+
+def send_firmware(
+    ser,
+    firmware: bytes
+):
+
+    print(
+        "\n[5] Sending firmware..."
+    )
+
+    total_size = len(firmware)
 
     offset = 0
+
     packet_number = 0
 
-    while offset < firmware_size:
+    while offset < total_size:
 
         chunk = firmware[
             offset:
@@ -442,108 +742,440 @@ def firmware_update():
 
         print(
             f"\nPacket {packet_number}: "
-            f"offset={offset} "
-            f"length={len(chunk)}"
+            f"{offset}/{total_size} "
+            f"({len(chunk)} bytes)"
+        )
+
+        packet = create_firmware_data(
+            chunk
         )
 
         send_packet(
             ser,
-            CMD_FW_DATA,
-            chunk
+            packet
         )
 
-        # ----------------------------------------------
-        # Last packet
-        # ----------------------------------------------
+        response = receive_packet(
+            ser
+        )
 
-        if offset + len(chunk) == firmware_size:
-
-            wait_for_command(
-                ser,
-                CMD_UPDATE_SUCCESSFUL
-            )
+        if response is None:
 
             print(
-                "Firmware data transmission COMPLETE."
+                "ERROR: No response "
+                "from bootloader"
             )
+
+            return False
+
+        # ------------------------------------------------------
+        # Final packet
+        # ------------------------------------------------------
+
+        if (
+            offset + len(chunk)
+            >= total_size
+        ):
+
+            if (
+                response["command"]
+                != BL_CMD_UPDATE_SUCCESSFUL
+            ):
+
+                print(
+                    "ERROR: Expected "
+                    "UPDATE_SUCCESSFUL "
+                    f"(0x{BL_CMD_UPDATE_SUCCESSFUL:02X}), "
+                    f"got 0x"
+                    f"{response['command']:02X}"
+                )
+
+                return False
+
+            print(
+                "Firmware data transfer "
+                "completed."
+            )
+
+        # ------------------------------------------------------
+        # Normal packet
+        # ------------------------------------------------------
 
         else:
 
-            wait_for_ack(ser)
+            if (
+                response["command"]
+                != BL_CMD_ACK
+            ):
+
+                if (
+                    response["command"]
+                    == BL_CMD_NACK
+                ):
+
+                    error = (
+                        response["data"][0]
+                        if len(response["data"]) > 0
+                        else 0xFF
+                    )
+
+                    print(
+                        f"ERROR: NACK "
+                        f"0x{error:02X}"
+                    )
+
+                else:
+
+                    print(
+                        "ERROR: Unexpected "
+                        f"response 0x"
+                        f"{response['command']:02X}"
+                    )
+
+                return False
 
         offset += len(chunk)
 
         progress = (
-            offset * 100.0 /
-            firmware_size
-        )
+            offset * 100
+        ) // total_size
 
         print(
-            f"Progress: {progress:.1f}%"
+            f"Progress: "
+            f"{progress}%"
         )
 
-    # ========================================================
-    # 6. CRC CHECK
-    # ========================================================
+    return True
 
-    print()
-    print("[6] Sending CRC CHECK...")
 
-    # Bootloader currently expects:
-    # data[0] = CRC MSB
-    # data[1] = CRC LSB
+# ==============================================================
+# Send Firmware CRC
+#
+# C bootloader expects:
+#
+# expected_crc =
+#     ((uint16_t)data[0] << 8U) |
+#     data[1];
+#
+# Therefore send Big-Endian.
+# ==============================================================
 
-    crc_data = struct.pack(
+def send_firmware_crc(
+    ser,
+    firmware_crc: int
+):
+
+    print(
+        "\n[6] Sending firmware CRC..."
+    )
+
+    print(
+        f"Firmware CRC: "
+        f"0x{firmware_crc:04X}"
+    )
+
+    clear_rx(ser)
+
+    data = struct.pack(
         ">H",
         firmware_crc
     )
 
-    send_packet(
-        ser,
-        CMD_CRC_CHECK,
-        crc_data
+    packet = create_command_data(
+        BL_CMD_CRC_CHECK,
+        data
     )
 
-    wait_for_ack(ser)
+    send_packet(
+        ser,
+        packet
+    )
+
+    if wait_for_ack(ser):
+
+        print(
+            "Firmware CRC verification "
+            "PASSED."
+        )
+
+        return True
+
+    print(
+        "Firmware CRC verification "
+        "FAILED."
+    )
+
+    return False
+
+
+# ==============================================================
+# Main Firmware Update
+# ==============================================================
+
+def main():
 
     print()
     print("=" * 60)
-    print(" FIRMWARE CRC VERIFIED SUCCESSFULLY")
+    print(
+        " STM32 BOOTLOADER FIRMWARE UPDATE"
+    )
     print("=" * 60)
 
-    ser.close()
+    # ----------------------------------------------------------
+    # Firmware file
+    # ----------------------------------------------------------
 
+    if FIRMWARE_FILE is None:
 
-# ============================================================
-# Main
-# ============================================================
+        print()
+        print(
+            "ERROR: No firmware .bin file found."
+        )
 
-if __name__ == "__main__":
+        print(
+            "Place the .bin file in:"
+        )
+
+        print(
+            f"    {SCRIPT_DIR}"
+        )
+
+        print(
+            "or:"
+        )
+
+        print(
+            f"    {SCRIPT_DIR.parent}"
+        )
+
+        input(
+            "\nPress Enter to exit..."
+        )
+
+        return
+
+    print(
+        f"Firmware file : "
+        f"{FIRMWARE_FILE}"
+    )
+
+    # ----------------------------------------------------------
+    # Read firmware
+    # ----------------------------------------------------------
 
     try:
 
-        firmware_update()
+        with open(
+            FIRMWARE_FILE,
+            "rb"
+        ) as file:
 
-    except FileNotFoundError:
+            firmware = file.read()
 
-        print(
-            f"ERROR: Firmware file "
-            f"'{FIRMWARE_FILE}' not found."
-        )
-
-    except serial.SerialException as e:
+    except Exception as error:
 
         print(
-            f"Serial ERROR: {e}"
+            f"ERROR: Cannot read firmware: "
+            f"{error}"
         )
 
-    except Exception as e:
+        input(
+            "\nPress Enter to exit..."
+        )
+
+        return
+
+    firmware_size = len(firmware)
+
+    if firmware_size == 0:
 
         print(
-            f"ERROR: {e}"
+            "ERROR: Firmware file is empty."
         )
+
+        input(
+            "\nPress Enter to exit..."
+        )
+
+        return
+
+    # ----------------------------------------------------------
+    # Calculate firmware CRC
+    # ----------------------------------------------------------
+
+    firmware_crc = calculate_firmware_crc(
+        firmware
+    )
+
+    print(
+        f"Firmware size : "
+        f"{firmware_size} bytes "
+        f"({firmware_size / 1024:.2f} KB)"
+    )
+
+    print(
+        f"App address   : "
+        f"0x{APP_START_ADDRESS:08X}"
+    )
+
+    print(
+        f"Firmware CRC  : "
+        f"0x{firmware_crc:04X}"
+    )
+
+    # ----------------------------------------------------------
+    # Open serial
+    # ----------------------------------------------------------
+
+    try:
+
+        ser = serial.Serial(
+            port=PORT,
+            baudrate=BAUDRATE,
+            timeout=0.05
+        )
+
+    except Exception as error:
+
+        print()
+        print(
+            f"ERROR: Cannot open serial port: "
+            f"{error}"
+        )
+
+        input(
+            "\nPress Enter to exit..."
+        )
+
+        return
+
+    print()
+    print(
+        "Serial connected."
+    )
+
+    try:
+
+        # ------------------------------------------------------
+        # 1. SYNC
+        # ------------------------------------------------------
+
+        if not send_sync(ser):
+
+            print(
+                "\nERROR: SYNC failed."
+            )
+
+            return
+
+        # ------------------------------------------------------
+        # 2. DEVICE ID
+        # ------------------------------------------------------
+
+        if not request_device_id(ser):
+
+            print(
+                "\nERROR: Device ID request failed."
+            )
+
+            return
+
+        # ------------------------------------------------------
+        # 3. FIRMWARE SIZE
+        # ------------------------------------------------------
+
+        if not send_firmware_size(
+            ser,
+            firmware_size
+        ):
+
+            print(
+                "\nERROR: Firmware size rejected."
+            )
+
+            return
+
+        # ------------------------------------------------------
+        # 4. START ADDRESS
+        # ------------------------------------------------------
+
+        if not send_start_address(ser):
+
+            print(
+                "\nERROR: Application start "
+                "address rejected."
+            )
+
+            return
+
+        # ------------------------------------------------------
+        # 5. FIRMWARE DATA
+        # ------------------------------------------------------
+
+        if not send_firmware(
+            ser,
+            firmware
+        ):
+
+            print(
+                "\nERROR: Firmware transfer failed."
+            )
+
+            return
+
+        # ------------------------------------------------------
+        # 6. FIRMWARE CRC
+        # ------------------------------------------------------
+
+        if not send_firmware_crc(
+            ser,
+            firmware_crc
+        ):
+
+            print(
+                "\nERROR: Firmware verification failed."
+            )
+
+            return
+
+        # ------------------------------------------------------
+        # SUCCESS
+        # ------------------------------------------------------
+
+        print()
+        print("=" * 60)
+        print(
+            " FIRMWARE UPDATE SUCCESSFUL"
+        )
+        print("=" * 60)
+        print(
+            f"Firmware size : "
+            f"{firmware_size} bytes"
+        )
+        print(
+            f"Firmware CRC  : "
+            f"0x{firmware_crc:04X}"
+        )
+        print(
+            f"App address   : "
+            f"0x{APP_START_ADDRESS:08X}"
+        )
+        print("=" * 60)
 
     finally:
 
-        print()
-        input("Press Enter to exit...")
+        ser.close()
+
+        print(
+            "\nSerial disconnected."
+        )
+
+
+# ==============================================================
+# Entry Point
+# ==============================================================
+
+if __name__ == "__main__":
+
+    main()
+
