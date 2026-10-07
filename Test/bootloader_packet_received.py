@@ -6,7 +6,7 @@ import time
 # Configuration
 # ============================================================
 
-COM_PORT = "COM11"
+COM_PORT = "COM6"
 BAUDRATE = 115200
 
 SOF = 0xA5
