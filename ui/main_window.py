@@ -1,46 +1,48 @@
 
 """
 Universal Firmware Updater
-Modern Dark Engineering UI
-Framework: PySide6
+Main Window - Midnight Engineer Theme
 
 Features:
-- COM port selection and refresh
-- Repeated SYNC until MCU ACK
-- Persistent serial connection
-- Connected-state indicator
-- Firmware selection and CRC display
-- Update using the existing connection
-- Background threads to keep the GUI responsive
+- Serial Connect / Disconnect
+- Complete bootloader handshake and device ID verification
+- Firmware selection and update
+- Progress reporting and activity log
+- Firmware erase command
+- Reuse of GUI-owned serial connection
 """
 
 import sys
-import threading
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QThread, Signal, Slot, Qt
+# Allow direct execution:
+# python ui/main_window.py
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QApplication,
-    QComboBox,
-    QFileDialog,
-    QFrame,
-    QGridLayout,
-    QHBoxLayout,
-    QLabel,
     QMainWindow,
-    QMessageBox,
-    QProgressBar,
-    QPushButton,
-    QSizePolicy,
-    QTextEdit,
-    QVBoxLayout,
     QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QComboBox,
+    QLineEdit,
+    QFileDialog,
+    QProgressBar,
+    QPlainTextEdit,
+    QGroupBox,
+    QMessageBox,
+    QFrame,
+    QSizePolicy,
 )
 
-from serial.tools import list_ports
-
-from app.firmware import FirmwareManager
 from app.serial_port import SerialPort
 from app.protocol_manager import ProtocolManager
 from app.updater import FirmwareUpdater, UpdateResult
@@ -50,215 +52,141 @@ from app.updater import FirmwareUpdater, UpdateResult
 # Configuration
 # ============================================================
 
-BAUDRATE_OPTIONS = [
-    9600,
-    19200,
-    38400,
-    57600,
-    115200,
-    230400,
-    460800,
-]
-
-# Update this list according to the target MCU memory layout.
-APP_ADDRESS_OPTIONS = [
-    "0x08004000",
-]
-
-CHUNK_SIZE_OPTIONS = ["4", "8", "16"]
-
-SYNC_RETRY_DELAY_MS = 250
+DEFAULT_BAUDRATE = 115200
+DEFAULT_APP_ADDRESS = "0x08004000"
+DEFAULT_CHUNK_SIZE = 16
+CONNECTION_ATTEMPTS = 3
 
 
 # ============================================================
-# Dark Engineering Theme
+# Midnight Engineer Theme
 # ============================================================
 
-DARK_STYLE = """
-QMainWindow, QWidget#centralWidget {
-    background-color: #10141C;
-    color: #E6EDF7;
-}
-
-QWidget {
-    color: #E6EDF7;
+APP_STYLE = """
+QMainWindow, QWidget {
+    background-color: #171A19;
+    color: #E6EAE7;
     font-family: "Segoe UI";
     font-size: 10pt;
 }
 
-QFrame#card {
-    background-color: #191F2B;
-    border: 1px solid #2B3445;
-    border-radius: 12px;
-}
-
-QLabel#pageTitle {
-    font-size: 23pt;
-    font-weight: 700;
-    color: #F4F7FF;
-}
-
-QLabel#subtitle {
-    font-size: 9pt;
-    color: #8D9BB2;
-}
-
-QLabel#sectionTitle {
-    font-size: 11pt;
+QGroupBox {
+    background-color: #1E2321;
+    border: 1px solid #343C37;
+    border-radius: 8px;
+    margin-top: 12px;
+    padding: 16px 10px 10px 10px;
     font-weight: 600;
-    color: #C9D6EA;
+    color: #DCE4DE;
 }
 
-QLabel#fieldLabel {
-    color: #8D9BB2;
-    font-size: 9pt;
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 6px;
+    color: #8DBB9A;
 }
 
-QLabel#valueLabel {
-    color: #F4F7FF;
-    font-size: 10pt;
-    font-weight: 600;
+QLabel {
+    background: transparent;
 }
 
-QLabel#statusDisconnected {
-    color: #FF7777;
-    font-weight: 700;
-}
-
-QLabel#statusConnecting {
-    color: #FFC36B;
-    font-weight: 700;
-}
-
-QLabel#statusConnected {
-    color: #42D9A0;
-    font-weight: 700;
+QLineEdit, QComboBox {
+    background-color: #111412;
+    color: #E6EAE7;
+    border: 1px solid #3B4540;
+    border-radius: 5px;
+    padding: 7px 9px;
+    min-height: 20px;
+    selection-background-color: #426C50;
 }
 
 QComboBox {
-    background-color: #111722;
-    border: 1px solid #344158;
-    border-radius: 7px;
-    padding: 9px;
-    min-height: 18px;
-}
-
-QComboBox:hover {
-    border: 1px solid #4C8DFF;
-}
-
-QComboBox:disabled {
-    color: #647188;
-    background-color: #171C26;
+    padding-right: 24px;
 }
 
 QComboBox QAbstractItemView {
-    background-color: #191F2B;
-    selection-background-color: #245BC4;
-    border: 1px solid #344158;
+    background-color: #202622;
+    color: #E6EAE7;
+    selection-background-color: #355940;
+    border: 1px solid #46534A;
+    outline: 0;
 }
 
 QPushButton {
-    background-color: #242D3D;
-    border: 1px solid #35435A;
-    border-radius: 7px;
-    padding: 10px 14px;
+    background-color: #29312C;
+    color: #E6EAE7;
+    border: 1px solid #455148;
+    border-radius: 6px;
+    padding: 8px 12px;
+    min-height: 20px;
     font-weight: 600;
 }
 
 QPushButton:hover {
-    background-color: #303C51;
-    border-color: #4C8DFF;
+    background-color: #35443A;
+    border-color: #71977A;
+}
+
+QPushButton:pressed {
+    background-color: #24372A;
 }
 
 QPushButton:disabled {
-    background-color: #202633;
-    color: #647188;
-    border-color: #2B3445;
+    background-color: #242825;
+    color: #737B75;
+    border-color: #303631;
 }
 
-QPushButton#connectButton {
-    background-color: #245BC4;
-    color: white;
-    border: none;
-    padding: 12px 20px;
-    font-weight: 700;
+QPushButton#primaryButton {
+    background-color: #416D4D;
+    color: #FFFFFF;
+    border: 1px solid #588665;
 }
 
-QPushButton#connectButton:hover {
-    background-color: #3478F6;
+QPushButton#primaryButton:hover {
+    background-color: #4D805B;
 }
 
-QPushButton#connectingButton {
-    background-color: #805B20;
-    color: white;
-    border: none;
-    padding: 12px 20px;
+QPushButton#dangerButton {
+    background-color: #653A35;
+    border: 1px solid #875047;
+    color: #FFFFFF;
 }
 
-QPushButton#connectedButton {
-    background-color: #176B4B;
-    color: white;
-    border: none;
-    padding: 12px 20px;
-    font-weight: 700;
+QPushButton#dangerButton:hover {
+    background-color: #79463F;
 }
 
-QPushButton#disconnectButton {
-    background-color: #43252D;
-    color: #FFAAAA;
-    border: 1px solid #70404B;
-}
-
-QPushButton#updateButton {
-    background-color: #3478F6;
-    color: white;
-    border: none;
-    padding: 12px 22px;
-    font-weight: 700;
-}
-
-QPushButton#updateButton:hover {
-    background-color: #4C8DFF;
+QPlainTextEdit {
+    background-color: #101311;
+    color: #BBD4C1;
+    border: 1px solid #343C37;
+    border-radius: 6px;
+    padding: 8px;
+    selection-background-color: #355940;
+    font-family: Consolas, "Courier New";
+    font-size: 9pt;
 }
 
 QProgressBar {
-    background-color: #101722;
-    border: 1px solid #303C50;
-    border-radius: 6px;
-    height: 16px;
+    background-color: #101311;
+    color: #FFFFFF;
+    border: 1px solid #39443C;
+    border-radius: 5px;
     text-align: center;
+    min-height: 22px;
+    max-height: 22px;
 }
 
 QProgressBar::chunk {
-    background-color: #3478F6;
-    border-radius: 5px;
-}
-
-QTextEdit {
-    background-color: #0C1119;
-    color: #B9C9DF;
-    border: 1px solid #2B3445;
-    border-radius: 8px;
-    padding: 10px;
-    selection-background-color: #245BC4;
-}
-
-QScrollBar:vertical {
-    background: #10141C;
-    width: 10px;
-    margin: 2px;
-}
-
-QScrollBar::handle:vertical {
-    background: #354158;
+    background-color: #527E5C;
     border-radius: 4px;
-    min-height: 25px;
 }
 
-QScrollBar::add-line:vertical,
-QScrollBar::sub-line:vertical {
-    height: 0;
+QFrame#separator {
+    background-color: #343C37;
+    max-height: 1px;
 }
 """
 
@@ -267,35 +195,29 @@ QScrollBar::sub-line:vertical {
 # Connection Worker
 # ============================================================
 
-class ConnectionWorker(QObject):
-    """
-    Opens the serial port and retries SYNC until the bootloader
-    responds with a valid ACK.
-
-    On successful connection, the serial port remains open.
-    """
-
-    connected = Signal(object, object)
+class ConnectionWorker(QThread):
     log = Signal(str)
+    connected = Signal(object, object, object)
     failed = Signal(str)
-    finished = Signal()
 
-    def __init__(self, port: str, baudrate: int):
-        super().__init__()
+    def __init__(self, port_name, baudrate, parent=None):
+        super().__init__(parent)
 
-        self.port = port
+        self.port_name = port_name
         self.baudrate = baudrate
-
-        self.cancel_event = threading.Event()
 
         self.serial_port = None
         self.protocol = None
 
-    @Slot()
     def run(self):
         try:
+            self.log.emit(
+                f"Opening {self.port_name} "
+                f"at {self.baudrate} baud..."
+            )
+
             self.serial_port = SerialPort(
-                port=self.port,
+                port=self.port_name,
                 baudrate=self.baudrate,
             )
 
@@ -303,129 +225,176 @@ class ConnectionWorker(QObject):
 
             self.protocol = ProtocolManager(
                 serial_port=self.serial_port,
-                response_timeout=2.0,
+                response_timeout=10.0,
             )
 
+            self.log.emit("Serial port opened.")
             self.log.emit(
-                f"Serial opened: {self.port} @ {self.baudrate}"
+                "Starting bootloader handshake..."
             )
 
-            while not self.cancel_event.is_set():
-                self.log.emit("TX: SYNC request")
+            last_error = None
+            device_id = None
 
+            for attempt in range(1, CONNECTION_ATTEMPTS + 1):
                 try:
-                    # This method must wait for a valid ACK.
-                    self.protocol.send_sync()
-
-                    if self.cancel_event.is_set():
-                        break
-
-                    self.log.emit("RX: SYNC ACK received")
-
-                    # Keep the serial port open after connection.
-                    self.connected.emit(
-                        self.serial_port,
-                        self.protocol,
+                    self.log.emit(
+                        f"Handshake attempt "
+                        f"{attempt}/{CONNECTION_ATTEMPTS}"
                     )
-                    return
+
+                    # Complete handshake:
+                    # SYNC -> ACK
+                    # DEVICE_ID_REQ -> DEVICE_ID_RES
+                    # Verify UID -> DEVICE_ID_CONFIRM -> ACK
+                    device_id = (
+                        self.protocol.connect_and_verify()
+                    )
+
+                    # Do not report connection success unless
+                    # the ProtocolManager confirms verification.
+                    if not self.protocol.is_device_verified:
+                        raise RuntimeError(
+                            "Device verification was not completed."
+                        )
+
+                    break
 
                 except Exception as exc:
-                    if self.cancel_event.is_set():
-                        break
+                    last_error = exc
 
                     self.log.emit(
-                        f"No valid SYNC response: {exc}"
+                        f"Handshake attempt {attempt} failed: {exc}"
                     )
 
-                    # Prevent continuous high-speed retry loops.
-                    self.cancel_event.wait(
-                        SYNC_RETRY_DELAY_MS / 1000.0
-                    )
+                    device_id = None
 
-            self._close_port()
+            if device_id is None:
+                raise RuntimeError(
+                    "Bootloader handshake failed after "
+                    f"{CONNECTION_ATTEMPTS} attempts. "
+                    f"Last error: {last_error}"
+                )
+
+            self.log.emit(
+                f"Device ID received: {device_id.hex().upper()}"
+            )
+            self.log.emit(
+                "Device ID handshake completed successfully."
+            )
+
+            self.connected.emit(
+                self.serial_port,
+                self.protocol,
+                device_id,
+            )
 
         except Exception as exc:
-            self._close_port()
+            if self.serial_port is not None:
+                try:
+                    self.serial_port.close()
+                except Exception:
+                    pass
 
-            if not self.cancel_event.is_set():
-                self.failed.emit(str(exc) or type(exc).__name__)
-
-        finally:
-            self.finished.emit()
-
-    def cancel(self):
-        self.cancel_event.set()
-
-    def _close_port(self):
-        if self.serial_port is not None:
-            try:
-                self.serial_port.close()
-            except Exception:
-                pass
+            self.failed.emit(str(exc))
 
 
 # ============================================================
 # Firmware Update Worker
 # ============================================================
 
-class UpdateWorker(QObject):
-    """Runs firmware update on an existing serial connection."""
-
+class UpdateWorker(QThread):
     progress = Signal(int, str)
     log = Signal(str)
-    finished = Signal(object)
+    update_completed = Signal(object)
 
     def __init__(
         self,
-        port: str,
-        baudrate: int,
-        app_address: int,
-        chunk_size: int,
-        firmware_path: Path,
-        serial_port: SerialPort,
-        protocol: ProtocolManager,
+        port,
+        baudrate,
+        app_start_address,
+        chunk_size,
+        firmware_path,
+        serial_port,
+        protocol_manager,
+        parent=None,
     ):
-        super().__init__()
+        super().__init__(parent)
 
         self.port = port
         self.baudrate = baudrate
-        self.app_address = app_address
+        self.app_start_address = app_start_address
         self.chunk_size = chunk_size
         self.firmware_path = firmware_path
-
         self.serial_port = serial_port
-        self.protocol = protocol
+        self.protocol_manager = protocol_manager
 
-    @Slot()
     def run(self):
         try:
             updater = FirmwareUpdater(
                 port=self.port,
                 baudrate=self.baudrate,
-                app_start_address=self.app_address,
+                app_start_address=self.app_start_address,
                 chunk_size=self.chunk_size,
-                progress_callback=self._on_progress,
-                log_callback=self._on_log,
+                progress_callback=self.progress.emit,
+                log_callback=self.log.emit,
                 serial_port=self.serial_port,
-                protocol_manager=self.protocol,
+                protocol_manager=self.protocol_manager,
+            )
+
+            self.log.emit(
+                f"Loading firmware: {self.firmware_path}"
             )
 
             updater.select_firmware(self.firmware_path)
+
             result = updater.run_update()
 
+            self.update_completed.emit(result)
+
         except Exception as exc:
-            result = UpdateResult(
-                success=False,
-                message=str(exc) or type(exc).__name__,
+            self.log.emit(f"UPDATE ERROR: {exc}")
+
+            self.update_completed.emit(
+                UpdateResult(
+                    success=False,
+                    message=str(exc),
+                )
             )
 
-        self.finished.emit(result)
 
-    def _on_progress(self, percentage: int, message: str):
-        self.progress.emit(percentage, message)
+# ============================================================
+# Erase Worker
+# ============================================================
 
-    def _on_log(self, message: str):
-        self.log.emit(message)
+class EraseWorker(QThread):
+    log = Signal(str)
+    erase_completed = Signal(bool, str)
+
+    def __init__(self, protocol_manager, parent=None):
+        super().__init__(parent)
+        self.protocol_manager = protocol_manager
+
+    def run(self):
+        try:
+            self.log.emit(
+                "Sending firmware erase command..."
+            )
+
+            self.protocol_manager.erase_firmware()
+
+            self.log.emit(
+                "Firmware erase command acknowledged."
+            )
+
+            self.erase_completed.emit(
+                True,
+                "Firmware erase completed successfully.",
+            )
+
+        except Exception as exc:
+            self.log.emit(f"ERASE ERROR: {exc}")
+            self.erase_completed.emit(False, str(exc))
 
 
 # ============================================================
@@ -438,789 +407,695 @@ class MainWindow(QMainWindow):
         super().__init__()
 
         self.setWindowTitle("Universal Firmware Updater")
-        self.resize(1080, 800)
-        self.setMinimumSize(900, 700)
+        self.resize(1050, 760)
+        self.setMinimumSize(760, 600)
+        self.setStyleSheet(APP_STYLE)
 
-        self.firmware_path = None
+        self.serial_port = None
+        self.protocol = None
+        self.device_id = None
 
-        # Connection state
-        self.connection_state = "disconnected"
-        self.serial_connection = None
-        self.protocol_connection = None
-
-        # Thread references
-        self.connection_thread = None
         self.connection_worker = None
-
-        self.update_thread = None
         self.update_worker = None
+        self.erase_worker = None
 
-        self.update_running = False
-        self.closing = False
+        self.firmware_path = ""
 
         self._build_ui()
-        self.refresh_ports()
-        self._set_connection_state("disconnected")
-
-        self.append_log("Universal Firmware Updater initialized.")
-        self.append_log("Select the target COM port, then Connect.")
+        self._update_controls()
 
     # ========================================================
-    # UI Helpers
-    # ========================================================
-
-    def make_card(self, title: str):
-        card = QFrame()
-        card.setObjectName("card")
-
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(18, 16, 18, 18)
-        layout.setSpacing(14)
-
-        heading = QLabel(title)
-        heading.setObjectName("sectionTitle")
-        layout.addWidget(heading)
-
-        return card, layout
-
-    def make_field(self, label_text: str, widget: QWidget):
-        container = QWidget()
-
-        layout = QVBoxLayout(container)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(7)
-
-        label = QLabel(label_text.upper())
-        label.setObjectName("fieldLabel")
-
-        layout.addWidget(label)
-        layout.addWidget(widget)
-
-        return container
-
-    # ========================================================
-    # Build UI
+    # UI Construction
     # ========================================================
 
     def _build_ui(self):
         central = QWidget()
-        central.setObjectName("centralWidget")
         self.setCentralWidget(central)
 
         root = QVBoxLayout(central)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(18)
+        root.setContentsMargins(22, 18, 22, 18)
+        root.setSpacing(14)
 
         # Header
         header = QHBoxLayout()
 
-        title_column = QVBoxLayout()
-        title_column.setSpacing(4)
+        title_layout = QVBoxLayout()
+        title_layout.setSpacing(3)
 
-        title = QLabel("Universal Firmware Updater")
-        title.setObjectName("pageTitle")
+        title = QLabel("UNIVERSAL FIRMWARE UPDATER")
+        title.setFont(
+            QFont("Segoe UI", 17, QFont.Weight.Bold)
+        )
+        title.setStyleSheet("color: #E8EEE9;")
 
         subtitle = QLabel(
-            "EMBEDDED SYSTEMS  /  STM32 BOOTLOADER  /  UART"
+            "STM32 Bootloader  •  UART Firmware Programming"
         )
-        subtitle.setObjectName("subtitle")
+        subtitle.setStyleSheet(
+            "color: #8C9990; font-size: 9pt;"
+        )
 
-        title_column.addWidget(title)
-        title_column.addWidget(subtitle)
+        title_layout.addWidget(title)
+        title_layout.addWidget(subtitle)
 
-        header.addLayout(title_column)
+        header.addLayout(title_layout)
         header.addStretch()
 
-        self.header_status = QLabel("●  DISCONNECTED")
-        self.header_status.setObjectName("statusDisconnected")
-
-        header.addWidget(
-            self.header_status,
-            alignment=Qt.AlignmentFlag.AlignTop,
+        self.status_label = QLabel("● DISCONNECTED")
+        self.status_label.setStyleSheet(
+            "color: #D58A7D; font-weight: bold;"
         )
 
+        header.addWidget(self.status_label)
         root.addLayout(header)
 
-        # Connection settings
-        connection_card, connection_layout = self.make_card(
-            "01  /  Connection & Transfer Settings"
+        separator = QFrame()
+        separator.setObjectName("separator")
+        separator.setFrameShape(QFrame.Shape.HLine)
+        root.addWidget(separator)
+
+        # Main panels
+        top_layout = QHBoxLayout()
+        top_layout.setSpacing(14)
+
+        top_layout.addWidget(
+            self._build_connection_group(),
+            1,
+        )
+        top_layout.addWidget(
+            self._build_firmware_group(),
+            1,
         )
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(14)
-        grid.setVerticalSpacing(10)
-
-        self.port_combo = QComboBox()
-        self.port_combo.setMinimumWidth(150)
-
-        self.baud_combo = QComboBox()
-        self.baud_combo.addItems(
-            [str(rate) for rate in BAUDRATE_OPTIONS]
-        )
-        self.baud_combo.setCurrentText("115200")
-
-        self.address_combo = QComboBox()
-        self.address_combo.addItems(APP_ADDRESS_OPTIONS)
-
-        self.chunk_combo = QComboBox()
-        self.chunk_combo.addItems(CHUNK_SIZE_OPTIONS)
-        self.chunk_combo.setCurrentText("16")
-
-        self.refresh_button = QPushButton("↻  Refresh Ports")
-        self.refresh_button.clicked.connect(self.refresh_ports)
-
-        grid.addWidget(
-            self.make_field("Serial Port", self.port_combo), 0, 0
-        )
-        grid.addWidget(
-            self.make_field("Baud Rate", self.baud_combo), 0, 1
-        )
-        grid.addWidget(
-            self.make_field(
-                "Application Address", self.address_combo
-            ), 1, 0
-        )
-        grid.addWidget(
-            self.make_field(
-                "Chunk Size (bytes)", self.chunk_combo
-            ), 1, 1
-        )
-        grid.addWidget(self.refresh_button, 0, 2)
-
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-
-        connection_layout.addLayout(grid)
-
-        # Connection controls
-        connection_controls = QHBoxLayout()
-
-        self.connect_button = QPushButton("Connect")
-        self.connect_button.setObjectName("connectButton")
-        self.connect_button.clicked.connect(self.connect_device)
-
-        self.disconnect_button = QPushButton("Disconnect")
-        self.disconnect_button.setObjectName("disconnectButton")
-        self.disconnect_button.clicked.connect(self.disconnect_device)
-        self.disconnect_button.setEnabled(False)
-
-        self.connection_detail = QLabel(
-            "No MCU connection established"
-        )
-        self.connection_detail.setObjectName("subtitle")
-
-        connection_controls.addWidget(self.connect_button)
-        connection_controls.addWidget(self.disconnect_button)
-        connection_controls.addWidget(self.connection_detail, 1)
-
-        connection_layout.addLayout(connection_controls)
-        root.addWidget(connection_card)
-
-        # Firmware
-        firmware_card, firmware_layout = self.make_card(
-            "02  /  Firmware Image"
-        )
-
-        file_row = QHBoxLayout()
-        file_row.setSpacing(12)
-
-        file_column = QVBoxLayout()
-        file_column.setSpacing(5)
-
-        self.firmware_name = QLabel("No firmware selected")
-        self.firmware_name.setObjectName("valueLabel")
-        self.firmware_name.setWordWrap(True)
-
-        self.firmware_details = QLabel(
-            "Select a compiled .bin firmware file."
-        )
-        self.firmware_details.setObjectName("subtitle")
-        self.firmware_details.setWordWrap(True)
-
-        file_column.addWidget(self.firmware_name)
-        file_column.addWidget(self.firmware_details)
-
-        file_row.addLayout(file_column, 1)
-
-        self.browse_button = QPushButton("Browse .bin  ↗")
-        self.browse_button.setObjectName("browseButton")
-        self.browse_button.clicked.connect(self.browse_firmware)
-
-        file_row.addWidget(self.browse_button)
-        firmware_layout.addLayout(file_row)
-
-        root.addWidget(firmware_card)
+        root.addLayout(top_layout)
 
         # Progress
-        progress_card, progress_layout = self.make_card(
-            "03  /  Update Progress"
+        progress_group = QGroupBox("Update Progress")
+        progress_layout = QVBoxLayout(progress_group)
+        progress_layout.setSpacing(8)
+
+        self.progress_status = QLabel("Ready.")
+        self.progress_status.setStyleSheet(
+            "color: #B6C5BA;"
         )
-
-        progress_header = QHBoxLayout()
-
-        self.progress_status = QLabel("Waiting for connection")
-        self.progress_status.setObjectName("subtitle")
-
-        self.progress_percent = QLabel("0%")
-        self.progress_percent.setObjectName("valueLabel")
-
-        progress_header.addWidget(self.progress_status)
-        progress_header.addStretch()
-        progress_header.addWidget(self.progress_percent)
-
-        progress_layout.addLayout(progress_header)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 100)
         self.progress_bar.setValue(0)
-        self.progress_bar.setFormat("")
-        self.progress_bar.setMinimumHeight(18)
+        self.progress_bar.setFormat("%p%")
 
+        progress_layout.addWidget(self.progress_status)
         progress_layout.addWidget(self.progress_bar)
 
-        self.device_status = QLabel("Device: Not connected")
-        self.device_status.setObjectName("subtitle")
-        progress_layout.addWidget(self.device_status)
+        root.addWidget(progress_group)
 
-        root.addWidget(progress_card)
+        # Activity log
+        log_group = QGroupBox("Activity Log")
+        log_layout = QVBoxLayout(log_group)
 
-        # Log
-        log_card, log_layout = self.make_card("04  /  Activity Log")
-
-        log_header = QHBoxLayout()
-
-        log_caption = QLabel("Connection events and update protocol")
-        log_caption.setObjectName("subtitle")
-
-        self.clear_button = QPushButton("Clear Log")
-        self.clear_button.clicked.connect(self.clear_log)
-
-        log_header.addWidget(log_caption)
-        log_header.addStretch()
-        log_header.addWidget(self.clear_button)
-
-        log_layout.addLayout(log_header)
-
-        self.log_view = QTextEdit()
+        self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setFont(QFont("Consolas", 9))
-        self.log_view.setMinimumHeight(140)
+        self.log_view.setPlaceholderText(
+            "Connection and firmware update messages "
+            "will appear here..."
+        )
+        self.log_view.setMinimumHeight(170)
         self.log_view.setSizePolicy(
             QSizePolicy.Policy.Expanding,
             QSizePolicy.Policy.Expanding,
         )
 
-        log_layout.addWidget(self.log_view)
-        root.addWidget(log_card, 1)
+        log_buttons = QHBoxLayout()
 
-        # Footer / Update button
-        footer = QHBoxLayout()
-
-        self.footer_message = QLabel(
-            "Connect to the MCU before starting an update"
+        self.clear_log_button = QPushButton("Clear Log")
+        self.clear_log_button.setFixedWidth(105)
+        self.clear_log_button.clicked.connect(
+            self.log_view.clear
         )
-        self.footer_message.setObjectName("subtitle")
 
-        self.update_button = QPushButton("▶  Update Firmware")
-        self.update_button.setObjectName("updateButton")
-        self.update_button.setEnabled(False)
-        self.update_button.clicked.connect(self.start_update)
+        log_buttons.addStretch()
+        log_buttons.addWidget(self.clear_log_button)
 
-        footer.addWidget(self.footer_message)
-        footer.addStretch()
-        footer.addWidget(self.update_button)
+        log_layout.addWidget(self.log_view)
+        log_layout.addLayout(log_buttons)
 
-        root.addLayout(footer)
+        root.addWidget(log_group, 1)
+
+        self._log(
+            "Universal Firmware Updater initialized."
+        )
+
+    def _build_connection_group(self):
+        group = QGroupBox("Connection")
+        layout = QGridLayout(group)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(12)
+
+        layout.addWidget(QLabel("COM Port"), 0, 0)
+
+        self.port_combo = QComboBox()
+        self.port_combo.setEditable(True)
+        self.port_combo.addItems(
+            [f"COM{i}" for i in range(1, 21)]
+        )
+        self.port_combo.setCurrentText("COM7")
+        self.port_combo.setMinimumWidth(110)
+
+        layout.addWidget(self.port_combo, 0, 1)
+
+        layout.addWidget(QLabel("Baud Rate"), 1, 0)
+
+        self.baudrate_combo = QComboBox()
+        self.baudrate_combo.addItems(
+            [
+                "9600",
+                "19200",
+                "38400",
+                "57600",
+                "115200",
+                "230400",
+            ]
+        )
+        self.baudrate_combo.setCurrentText(
+            str(DEFAULT_BAUDRATE)
+        )
+
+        layout.addWidget(self.baudrate_combo, 1, 1)
+
+        button_row = QHBoxLayout()
+
+        self.connect_button = QPushButton("Connect")
+        self.connect_button.setObjectName("primaryButton")
+        self.connect_button.setFixedWidth(115)
+        self.connect_button.clicked.connect(
+            self._connect
+        )
+
+        self.disconnect_button = QPushButton("Disconnect")
+        self.disconnect_button.setFixedWidth(115)
+        self.disconnect_button.clicked.connect(
+            self._disconnect
+        )
+
+        button_row.addWidget(self.connect_button)
+        button_row.addWidget(self.disconnect_button)
+        button_row.addStretch()
+
+        layout.addLayout(button_row, 2, 0, 1, 2)
+
+        self.connection_info = QLabel(
+            "Select a COM port and connect to the bootloader."
+        )
+        self.connection_info.setWordWrap(True)
+        self.connection_info.setStyleSheet(
+            "color: #8C9990; font-size: 9pt;"
+        )
+
+        layout.addWidget(
+            self.connection_info,
+            3, 0, 1, 2,
+        )
+
+        return group
+
+    def _build_firmware_group(self):
+        group = QGroupBox("Firmware Configuration")
+        layout = QGridLayout(group)
+        layout.setHorizontalSpacing(10)
+        layout.setVerticalSpacing(10)
+
+        layout.addWidget(
+            QLabel("Firmware File"),
+            0, 0, 1, 2,
+        )
+
+        file_row = QHBoxLayout()
+
+        self.firmware_path_edit = QLineEdit()
+        self.firmware_path_edit.setReadOnly(True)
+        self.firmware_path_edit.setPlaceholderText(
+            "Select a .bin firmware file..."
+        )
+
+        self.browse_button = QPushButton("Browse")
+        self.browse_button.setFixedWidth(90)
+        self.browse_button.clicked.connect(
+            self._browse_firmware
+        )
+
+        file_row.addWidget(self.firmware_path_edit, 1)
+        file_row.addWidget(self.browse_button)
+
+        layout.addLayout(file_row, 1, 0, 1, 2)
+
+        layout.addWidget(
+            QLabel("Application Address"),
+            2, 0,
+        )
+
+        self.address_edit = QLineEdit(
+            DEFAULT_APP_ADDRESS
+        )
+        self.address_edit.setToolTip(
+            "Target application's flash start address, "
+            "e.g. 0x08004000"
+        )
+
+        layout.addWidget(self.address_edit, 2, 1)
+
+        layout.addWidget(QLabel("Chunk Size"), 3, 0)
+
+        self.chunk_combo = QComboBox()
+        self.chunk_combo.addItems(["4", "8", "16"])
+        self.chunk_combo.setCurrentText(
+            str(DEFAULT_CHUNK_SIZE)
+        )
+
+        layout.addWidget(self.chunk_combo, 3, 1)
+
+        action_row = QHBoxLayout()
+
+        self.update_button = QPushButton(
+            "Update Firmware"
+        )
+        self.update_button.setObjectName("primaryButton")
+        self.update_button.setFixedWidth(145)
+        self.update_button.clicked.connect(
+            self._start_update
+        )
+
+        self.erase_button = QPushButton("Erase Firmware")
+        self.erase_button.setObjectName("dangerButton")
+        self.erase_button.setFixedWidth(130)
+        self.erase_button.clicked.connect(
+            self._erase_firmware
+        )
+
+        action_row.addWidget(self.update_button)
+        action_row.addWidget(self.erase_button)
+        action_row.addStretch()
+
+        layout.addLayout(action_row, 4, 0, 1, 2)
+
+        note = QLabel(
+            "Check the target MCU's flash layout "
+            "before programming."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet(
+            "color: #8C9990; font-size: 9pt;"
+        )
+
+        layout.addWidget(note, 5, 0, 1, 2)
+
+        return group
 
     # ========================================================
-    # Connection State
+    # Logging / Status
     # ========================================================
 
-    def _set_connection_state(self, state: str):
-        self.connection_state = state
+    def _log(self, message):
+        self.log_view.appendPlainText(str(message))
 
-        if state == "disconnected":
-            self.connect_button.setText("Connect")
-            self.connect_button.setObjectName("connectButton")
-            self.header_status.setText("●  DISCONNECTED")
-            self.header_status.setObjectName("statusDisconnected")
-
-            self.connection_detail.setText(
-                "No MCU connection established"
-            )
-            self.device_status.setText("Device: Not connected")
-
-            self.connect_button.setEnabled(True)
-            self.disconnect_button.setEnabled(False)
-            self.update_button.setEnabled(False)
-
-        elif state == "connecting":
-            self.connect_button.setText("Connecting...")
-            self.connect_button.setObjectName("connectingButton")
-            self.header_status.setText("●  CONNECTING")
-            self.header_status.setObjectName("statusConnecting")
-
-            self.connection_detail.setText(
-                "Waiting for bootloader SYNC response..."
-            )
-            self.device_status.setText(
-                "Device: Waiting for MCU response"
-            )
-
-            self.connect_button.setEnabled(False)
-            self.disconnect_button.setEnabled(True)
-            self.update_button.setEnabled(False)
-
-        elif state == "connected":
-            self.connect_button.setText("Connected ✓")
-            self.connect_button.setObjectName("connectedButton")
-            self.header_status.setText("●  CONNECTED")
-            self.header_status.setObjectName("statusConnected")
-
-            self.connection_detail.setText(
-                "Bootloader ACK received"
-            )
-            self.device_status.setText(
-                "Device: Bootloader connected"
-            )
-
-            self.connect_button.setEnabled(False)
-            self.disconnect_button.setEnabled(True)
-            self.update_button.setEnabled(
-                self.firmware_path is not None
-                and not self.update_running
-            )
-
-        # Refresh stylesheet so the button's state color changes.
-        self.connect_button.style().unpolish(self.connect_button)
-        self.connect_button.style().polish(self.connect_button)
-        self.header_status.style().unpolish(self.header_status)
-        self.header_status.style().polish(self.header_status)
-
-    # ========================================================
-    # Logging
-    # ========================================================
-
-    @Slot(str)
-    def append_log(self, message: str):
-        self.log_view.append(message)
-
-    @Slot()
-    def clear_log(self):
-        self.log_view.clear()
-
-    # ========================================================
-    # COM Ports
-    # ========================================================
-
-    @Slot()
-    def refresh_ports(self):
-        if self.connection_state != "disconnected":
-            self.append_log(
-                "Disconnect before changing the serial port."
-            )
-            return
-
-        previous = self.port_combo.currentText()
-        port_names = [
-            port.device for port in list_ports.comports()
-        ]
-
-        self.port_combo.clear()
-        self.port_combo.addItems(port_names)
-
-        if previous in port_names:
-            self.port_combo.setCurrentText(previous)
-
-        if port_names:
-            self.append_log(
-                "Available ports: " + ", ".join(port_names)
+    def _set_status(self, connected):
+        if connected:
+            self.status_label.setText("● CONNECTED")
+            self.status_label.setStyleSheet(
+                "color: #8BC49A; font-weight: bold;"
             )
         else:
-            self.append_log("WARNING: No serial ports detected.")
+            self.status_label.setText("● DISCONNECTED")
+            self.status_label.setStyleSheet(
+                "color: #D58A7D; font-weight: bold;"
+            )
+
+    def _is_device_verified(self):
+        """Return True only for an open, verified session."""
+        if self.serial_port is None or self.protocol is None:
+            return False
+
+        if not self.serial_port.is_open:
+            return False
+
+        return bool(
+            getattr(
+                self.protocol,
+                "is_device_verified",
+                False,
+            )
+        )
+
+    def _update_controls(self):
+        port_open = (
+            self.serial_port is not None
+            and self.protocol is not None
+            and self.serial_port.is_open
+        )
+
+        # Firmware actions require a verified handshake.
+        verified = (
+            port_open
+            and self._is_device_verified()
+        )
+
+        worker_busy = self._busy()
+
+        self.connect_button.setEnabled(
+            not worker_busy and not port_open
+        )
+
+        self.disconnect_button.setEnabled(
+            not worker_busy and port_open
+        )
+
+        self.update_button.setEnabled(
+            not worker_busy and verified
+        )
+
+        self.erase_button.setEnabled(
+            not worker_busy and verified
+        )
+
+        self.browse_button.setEnabled(not worker_busy)
+
+        self.port_combo.setEnabled(
+            not worker_busy and not port_open
+        )
+
+        self.baudrate_combo.setEnabled(
+            not worker_busy and not port_open
+        )
 
     # ========================================================
-    # Connect / SYNC Retry
+    # Connection
     # ========================================================
 
-    @Slot()
-    def connect_device(self):
-        if self.connection_state != "disconnected":
-            return
+    def _connect(self):
+        if self.connection_worker is not None:
+            if self.connection_worker.isRunning():
+                return
 
-        port = self.port_combo.currentText()
+        port = self.port_combo.currentText().strip()
 
         if not port:
             QMessageBox.warning(
                 self,
-                "No Serial Port",
-                "Select a valid COM port first.",
+                "Missing COM Port",
+                "Please select a serial port.",
             )
             return
 
-        baudrate = int(self.baud_combo.currentText())
+        try:
+            baudrate = int(
+                self.baudrate_combo.currentText()
+            )
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Invalid Baud Rate",
+                "Please select a valid baud rate.",
+            )
+            return
 
-        self._set_connection_state("connecting")
-        self.footer_message.setText(
-            "Sending SYNC requests until the MCU responds..."
+        self._log(f"Connecting to {port}...")
+        self.connection_info.setText(
+            "Opening serial port and verifying device..."
         )
 
-        self.append_log("-" * 55)
-        self.append_log(f"Connecting to {port} @ {baudrate}")
-        self.append_log("SYNC retry started.")
-        self.append_log("-" * 55)
-
-        self.connection_thread = QThread(self)
+        self._update_controls()
 
         self.connection_worker = ConnectionWorker(
-            port=port,
+            port_name=port,
             baudrate=baudrate,
+            parent=self,
         )
 
-        self.connection_worker.moveToThread(
-            self.connection_thread
-        )
+        self.connection_worker.log.connect(self._log)
 
-        self.connection_thread.started.connect(
-            self.connection_worker.run
-        )
-
-        self.connection_worker.log.connect(self.append_log)
         self.connection_worker.connected.connect(
-            self.on_device_connected
+            self._on_connected
         )
+
         self.connection_worker.failed.connect(
-            self.on_connection_failed
+            self._on_connection_failed
         )
 
         self.connection_worker.finished.connect(
-            self.connection_thread.quit
-        )
-        self.connection_thread.finished.connect(
-            self.on_connection_thread_finished
+            self._on_connection_worker_finished
         )
 
-        self.connection_thread.start()
+        self.connection_worker.start()
 
-    @Slot(object, object)
-    def on_device_connected(
+    def _on_connected(
         self,
-        serial_port: SerialPort,
-        protocol: ProtocolManager,
+        serial_port,
+        protocol,
+        device_id,
     ):
-        self.serial_connection = serial_port
-        self.protocol_connection = protocol
+        self.serial_port = serial_port
+        self.protocol = protocol
+        self.device_id = bytes(device_id)
 
-        self._set_connection_state("connected")
-
-        self.footer_message.setText(
-            "MCU connected. Firmware update is available."
-        )
-
-        self.append_log("CONNECTION SUCCESS: MCU ACK received.")
-        self.append_log("Serial connection remains open.")
-
-    @Slot(str)
-    def on_connection_failed(self, message: str):
-        self.serial_connection = None
-        self.protocol_connection = None
-
-        self._set_connection_state("disconnected")
-
-        self.footer_message.setText(
-            "Connection failed. Check the port and target MCU."
-        )
-
-        self.append_log("CONNECTION ERROR: " + message)
-
-        QMessageBox.warning(
-            self,
-            "Connection Failed",
-            message,
-        )
-
-    @Slot()
-    def on_connection_thread_finished(self):
-        self.connection_worker = None
-        self.connection_thread = None
-
-        # A cancelled connection attempt should return to idle.
-        if (
-            self.connection_state == "connecting"
-            and self.serial_connection is None
-        ):
-            self._set_connection_state("disconnected")
-
-    # ========================================================
-    # Disconnect
-    # ========================================================
-
-    @Slot()
-    def disconnect_device(self):
-        if self.update_running:
-            QMessageBox.information(
-                self,
-                "Update In Progress",
-                "Disconnect is disabled while firmware update is running.",
+        if not self._is_device_verified():
+            self._log(
+                "CONNECTION ERROR: Device verification "
+                "was not active after handshake."
             )
-            return
 
-        if self.connection_state == "connecting":
-            worker = self.connection_worker
-
-            if worker is not None:
-                worker.cancel()
-
-            self.append_log("Cancelling connection attempt...")
-            self.disconnect_button.setEnabled(False)
-            return
-
-        if self.connection_state == "connected":
             try:
-                if self.serial_connection is not None:
-                    self.serial_connection.close()
+                self.serial_port.close()
+            except Exception:
+                pass
+
+            self.serial_port = None
+            self.protocol = None
+            self.device_id = None
+
+            self._set_status(False)
+            self.connection_info.setText(
+                "Device verification failed."
+            )
+            self._update_controls()
+            return
+
+        port = self.port_combo.currentText().strip()
+        baudrate = self.baudrate_combo.currentText()
+
+        self._set_status(True)
+
+        self.connection_info.setText(
+            f"Verified device on {port} at {baudrate} baud."
+        )
+
+        self._log("Connection established.")
+        self._log(
+            f"Verified device UID: "
+            f"{self.device_id.hex().upper()}"
+        )
+
+        self._update_controls()
+
+    def _on_connection_failed(self, message):
+        self.serial_port = None
+        self.protocol = None
+        self.device_id = None
+
+        self._set_status(False)
+        self.connection_info.setText(
+            "Connection or device verification failed."
+        )
+
+        self._log(
+            f"CONNECTION ERROR: {message}"
+        )
+
+    def _on_connection_worker_finished(self):
+        self.connection_worker = None
+        self._update_controls()
+
+    def _disconnect(self):
+        if self._busy():
+            return
+
+        if self.serial_port is not None:
+            try:
+                self.serial_port.close()
+                self._log("Serial port closed.")
             except Exception as exc:
-                self.append_log(
-                    f"Error while closing serial port: {exc}"
+                self._log(
+                    f"Disconnect warning: {exc}"
                 )
 
-        self.serial_connection = None
-        self.protocol_connection = None
+        self.serial_port = None
+        self.protocol = None
+        self.device_id = None
 
-        self._set_connection_state("disconnected")
-        self.footer_message.setText(
-            "Disconnected. Connect to the MCU to continue."
-        )
-        self.append_log("Device disconnected.")
+        self._set_status(False)
+
+        self.connection_info.setText("Disconnected.")
+        self.progress_status.setText("Ready.")
+
+        self._update_controls()
 
     # ========================================================
     # Firmware Selection
     # ========================================================
 
-    @Slot()
-    def browse_firmware(self):
-        file_name, _ = QFileDialog.getOpenFileName(
+    def _browse_firmware(self):
+        file_path, _ = QFileDialog.getOpenFileName(
             self,
-            "Select Firmware Binary",
+            "Select Firmware",
             "",
-            "Firmware Binary (*.bin)",
+            "Firmware Binary (*.bin);;All Files (*)",
         )
 
-        if not file_name:
+        if not file_path:
             return
 
-        try:
-            firmware = FirmwareManager()
-            firmware.load(file_name)
+        self.firmware_path = file_path
+        self.firmware_path_edit.setText(file_path)
 
-            self.firmware_path = Path(file_name)
-
-            self.firmware_name.setText(
-                self.firmware_path.name
-            )
-            self.firmware_details.setText(
-                f"Size: {firmware.size:,} bytes    |    "
-                f"CRC16-CCITT-FALSE: 0x{firmware.crc:04X}"
-            )
-
-            self.progress_bar.setValue(0)
-            self.progress_percent.setText("0%")
-            self.progress_status.setText("Firmware loaded")
-
-            self.append_log(
-                f"Firmware loaded: {self.firmware_path}"
-            )
-            self.append_log(
-                f"Firmware size: {firmware.size} bytes"
-            )
-            self.append_log(
-                f"Firmware CRC16: 0x{firmware.crc:04X}"
-            )
-
-            # Update is enabled only if the MCU is connected.
-            self.update_button.setEnabled(
-                self.connection_state == "connected"
-                and not self.update_running
-            )
-
-        except Exception as exc:
-            self.firmware_path = None
-            self.firmware_name.setText("No firmware selected")
-            self.firmware_details.setText(
-                "Could not load firmware."
-            )
-            self.update_button.setEnabled(False)
-
-            QMessageBox.critical(
-                self,
-                "Firmware Error",
-                str(exc),
-            )
+        self._log(
+            f"Selected firmware: {file_path}"
+        )
 
     # ========================================================
     # Firmware Update
     # ========================================================
 
-    @Slot()
-    def start_update(self):
-        if self.update_running:
+    def _start_update(self):
+        if self._busy():
             return
 
-        if self.connection_state != "connected":
+        if not self._is_device_verified():
             QMessageBox.warning(
                 self,
-                "Not Connected",
-                "Connect to the MCU before updating firmware.",
+                "Device Not Verified",
+                (
+                    "Connect to the bootloader and complete "
+                    "device verification first."
+                ),
             )
             return
 
-        if (
-            self.serial_connection is None
-            or self.protocol_connection is None
-        ):
+        if not self.firmware_path:
             QMessageBox.warning(
                 self,
-                "Connection Error",
-                "The serial connection is not available. Reconnect.",
-            )
-            self._set_connection_state("disconnected")
-            return
-
-        if self.firmware_path is None:
-            QMessageBox.warning(
-                self,
-                "No Firmware",
-                "Select a .bin firmware file first.",
+                "Firmware Missing",
+                "Please select a .bin firmware file.",
             )
             return
 
-        port = self.port_combo.currentText()
-        baudrate = int(self.baud_combo.currentText())
-        app_address = int(self.address_combo.currentText(), 16)
-        chunk_size = int(self.chunk_combo.currentText())
+        try:
+            address = int(
+                self.address_edit.text().strip(),
+                0,
+            )
+        except ValueError:
+            QMessageBox.warning(
+                self,
+                "Invalid Address",
+                "Enter a valid address, e.g. 0x08004000.",
+            )
+            return
 
-        self.update_running = True
-        self.update_button.setEnabled(False)
-        self.connect_button.setEnabled(False)
-        self.disconnect_button.setEnabled(False)
-        self.browse_button.setEnabled(False)
-        self.refresh_button.setEnabled(False)
+        chunk_size = int(
+            self.chunk_combo.currentText()
+        )
+
+        port = self.port_combo.currentText().strip()
+        baudrate = int(
+            self.baudrate_combo.currentText()
+        )
+
+        confirm = QMessageBox.question(
+            self,
+            "Start Firmware Update",
+            (
+                "Start firmware update?\n\n"
+                f"Port: {port}\n"
+                f"Baud rate: {baudrate}\n"
+                f"Application address: 0x{address:08X}\n"
+                f"Chunk size: {chunk_size} bytes\n\n"
+                "Do not disconnect power during programming."
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
 
         self.progress_bar.setValue(0)
-        self.progress_percent.setText("0%")
-        self.progress_status.setText("Starting firmware update...")
-        self.footer_message.setText("Firmware update in progress")
-
-        self.append_log("-" * 55)
-        self.append_log("Firmware update started.")
-        self.append_log(f"Port: {port} @ {baudrate}")
-        self.append_log(
-            f"Application address: 0x{app_address:08X}"
+        self.progress_status.setText(
+            "Starting firmware update..."
         )
-        self.append_log(f"Chunk size: {chunk_size} bytes")
-        self.append_log("-" * 55)
 
-        self.update_thread = QThread(self)
+        self._log("========================================")
+        self._log("Starting firmware update...")
+
+        self._update_controls()
 
         self.update_worker = UpdateWorker(
             port=port,
             baudrate=baudrate,
-            app_address=app_address,
+            app_start_address=address,
             chunk_size=chunk_size,
             firmware_path=self.firmware_path,
-            serial_port=self.serial_connection,
-            protocol=self.protocol_connection,
+            serial_port=self.serial_port,
+            protocol_manager=self.protocol,
+            parent=self,
         )
 
-        self.update_worker.moveToThread(self.update_thread)
+        self.update_worker.progress.connect(
+            self._on_update_progress
+        )
 
-        self.update_thread.started.connect(self.update_worker.run)
+        self.update_worker.log.connect(self._log)
 
-        self.update_worker.progress.connect(self.on_progress)
-        self.update_worker.log.connect(self.append_log)
+        self.update_worker.update_completed.connect(
+            self._on_update_completed
+        )
+
         self.update_worker.finished.connect(
-            self.on_update_finished
+            self._on_update_worker_finished
         )
 
-        self.update_worker.finished.connect(
-            self.update_thread.quit
-        )
-        self.update_thread.finished.connect(
-            self.on_update_thread_finished
-        )
+        self.update_worker.start()
 
-        self.update_thread.start()
-
-    # ========================================================
-    # Update Progress
-    # ========================================================
-
-    @Slot(int, str)
-    def on_progress(self, percentage: int, message: str):
+    def _on_update_progress(
+        self,
+        percentage,
+        message,
+    ):
         self.progress_bar.setValue(percentage)
-        self.progress_percent.setText(f"{percentage}%")
         self.progress_status.setText(message)
 
-        if "Synchronizing" in message:
-            self.device_status.setText(
-                "Device: Synchronizing..."
-            )
-        elif "Requesting device ID" in message:
-            self.device_status.setText(
-                "Device: Reading device ID..."
-            )
-        elif "Transferred" in message:
-            self.device_status.setText(
-                "Device: Transferring firmware..."
-            )
-        elif "completed" in message.lower():
-            self.device_status.setText(
-                "Device: Update completed"
-            )
-
-    @Slot(object)
-    def on_update_finished(self, result: UpdateResult):
-        self.update_running = False
-
-        self.browse_button.setEnabled(True)
-        self.refresh_button.setEnabled(True)
-        self.disconnect_button.setEnabled(True)
-
-        # The persistent serial connection should remain open.
-        # Do not mark the device disconnected just because an
-        # update failed; allow retry or manual disconnect.
-        self._set_connection_state("connected")
-
+    def _on_update_completed(self, result):
         if result.success:
             self.progress_bar.setValue(100)
-            self.progress_percent.setText("100%")
+
             self.progress_status.setText(
-                "Firmware update completed"
-            )
-            self.device_status.setText(
-                f"Device ID: {result.device_id or 'Connected'}"
-            )
-            self.footer_message.setText(
-                "Firmware update successful. MCU remains connected."
+                "Firmware update completed successfully."
             )
 
-            self.append_log("UPDATE SUCCESS: " + result.message)
+            self._log("UPDATE SUCCESS")
 
             QMessageBox.information(
                 self,
-                "Update Successful",
+                "Update Complete",
                 result.message,
             )
 
         else:
             self.progress_status.setText(
-                "Firmware update failed"
-            )
-            self.footer_message.setText(
-                "Update failed. Check the log before retrying."
+                "Firmware update failed."
             )
 
-            self.append_log("UPDATE FAILED: " + result.message)
+            self._log(
+                f"UPDATE FAILED: {result.message}"
+            )
 
             QMessageBox.critical(
                 self,
@@ -1228,39 +1103,134 @@ class MainWindow(QMainWindow):
                 result.message,
             )
 
-    @Slot()
-    def on_update_thread_finished(self):
+    def _on_update_worker_finished(self):
         self.update_worker = None
-        self.update_thread = None
+        self._update_controls()
 
     # ========================================================
-    # Application Shutdown
+    # Erase Firmware
     # ========================================================
 
-    def closeEvent(self, event):
-        if self.update_running:
+    def _erase_firmware(self):
+        if self._busy():
+            return
+
+        if not self._is_device_verified():
             QMessageBox.warning(
                 self,
-                "Update In Progress",
-                "Wait for the firmware update to finish before closing.",
+                "Device Not Verified",
+                (
+                    "Connect to the bootloader and complete "
+                    "device verification before erasing firmware."
+                ),
+            )
+            return
+
+        confirm = QMessageBox.warning(
+            self,
+            "Confirm Firmware Erase",
+            (
+                "Are you sure you want to erase firmware?\n\n"
+                "This command must be supported by your STM32 "
+                "bootloader. The operation may make the "
+                "application unavailable until new firmware "
+                "is programmed."
+            ),
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self._log("Starting firmware erase...")
+        self.progress_status.setText(
+            "Erasing firmware..."
+        )
+
+        self._update_controls()
+
+        self.erase_worker = EraseWorker(
+            protocol_manager=self.protocol,
+            parent=self,
+        )
+
+        self.erase_worker.log.connect(self._log)
+
+        self.erase_worker.erase_completed.connect(
+            self._on_erase_completed
+        )
+
+        self.erase_worker.finished.connect(
+            self._on_erase_worker_finished
+        )
+
+        self.erase_worker.start()
+
+    def _on_erase_completed(self, success, message):
+        if success:
+            self.progress_status.setText(
+                "Erase completed."
+            )
+
+            self._log(message)
+
+            QMessageBox.information(
+                self,
+                "Erase Complete",
+                message,
+            )
+
+        else:
+            self.progress_status.setText(
+                "Erase failed."
+            )
+
+            self._log(
+                f"ERASE FAILED: {message}"
+            )
+
+            QMessageBox.critical(
+                self,
+                "Erase Failed",
+                message,
+            )
+
+    def _on_erase_worker_finished(self):
+        self.erase_worker = None
+        self._update_controls()
+
+    # ========================================================
+    # Helpers / Shutdown
+    # ========================================================
+
+    def _busy(self):
+        return any(
+            worker is not None and worker.isRunning()
+            for worker in (
+                self.connection_worker,
+                self.update_worker,
+                self.erase_worker,
+            )
+        )
+
+    def closeEvent(self, event):
+        if self._busy():
+            QMessageBox.warning(
+                self,
+                "Operation in Progress",
+                (
+                    "Wait for the current operation to finish "
+                    "before closing."
+                ),
             )
             event.ignore()
             return
 
-        if self.connection_state == "connecting":
-            worker = self.connection_worker
-            thread = self.connection_thread
-
-            if worker is not None:
-                worker.cancel()
-
-            if thread is not None:
-                thread.quit()
-                thread.wait(2500)
-
-        if self.serial_connection is not None:
+        if self.serial_port is not None:
             try:
-                self.serial_connection.close()
+                self.serial_port.close()
             except Exception:
                 pass
 
@@ -1272,14 +1242,19 @@ class MainWindow(QMainWindow):
 # ============================================================
 
 def main():
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    app.setStyleSheet(DARK_STYLE)
+    app = QApplication.instance()
+
+    if app is None:
+        app = QApplication(sys.argv)
 
     window = MainWindow()
     window.show()
 
-    sys.exit(app.exec())
+    # Keep a reference to the window for the app's lifetime.
+    app._main_window = window
+
+    if QApplication.instance() is app:
+        sys.exit(app.exec())
 
 
 if __name__ == "__main__":

@@ -68,6 +68,11 @@ ERROR_DEVICE_ID = 0x08
 ERROR_NO_RETRY_PACKET = 0x09
 ERROR_FLASH_ERASE = 0x0A
 ERROR_DATA = 0x0B
+CMD_ERASE_FIRMWARE = 0x60
+# Device Identification
+CMD_DEVICE_ID_REQ     = 0x3C
+CMD_DEVICE_ID_CONFIRM = 0x3D
+CMD_DEVICE_ID_RES     = 0x3F
 
 
 # ============================================================================
