@@ -56,7 +56,7 @@ from app.updater import FirmwareUpdater, UpdateResult
 DEFAULT_BAUDRATE = 115200
 DEFAULT_APP_ADDRESS = "0x08004000"
 DEFAULT_CHUNK_SIZE = 16
-CONNECTION_ATTEMPTS = 3
+CONNECTION_ATTEMPTS = 30
 
 
 # ============================================================

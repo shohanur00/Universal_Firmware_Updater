@@ -211,7 +211,7 @@ class ProtocolManager:
             create_command(CMD_SYNC)
         )
 
-        self.wait_for_ack(timeout=7.0)
+        self.wait_for_ack(timeout=1.0)
 
     # ========================================================================
     # Device ID
