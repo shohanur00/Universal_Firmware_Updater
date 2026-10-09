@@ -14,6 +14,7 @@ Features:
 
 import sys
 from pathlib import Path
+from PySide6.QtGui import QIcon
 
 # Allow direct execution:
 # python ui/main_window.py
@@ -1241,21 +1242,28 @@ class MainWindow(QMainWindow):
 # Application Entry Point
 # ============================================================
 
+
 def main():
     app = QApplication.instance()
 
     if app is None:
         app = QApplication(sys.argv)
 
+    project_root = Path(__file__).resolve().parent.parent
+    icon_path = project_root / "assets" / "app_icon.ico"
+
+    app.setWindowIcon(QIcon(str(icon_path)))
+
     window = MainWindow()
+    window.setWindowIcon(QIcon(str(icon_path)))
     window.show()
 
     # Keep a reference to the window for the app's lifetime.
     app._main_window = window
 
-    if QApplication.instance() is app:
-        sys.exit(app.exec())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
     main()
+
